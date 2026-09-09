@@ -1,0 +1,25 @@
+# Секреты — второй рубеж. Основной: они физически лежат в %USERPROFILE%\.avatars\
+.env
+*.env
+!.env.example
+secrets*
+
+# Данные и результаты прогонов — живут в C:\AvatarsData, сюда попасть не должны
+data/
+runs/
+refs/
+*.mp4
+*.wav
+*.mov
+*.mkv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/

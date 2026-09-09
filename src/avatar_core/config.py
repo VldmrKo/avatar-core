@@ -53,6 +53,18 @@ def _clean_value(raw: str) -> str:
     return value.strip().strip('"').strip("'")
 
 
+def _clean_env_value(raw: str) -> str:
+    """Значение из окружения: снимаем пробелы, \\r и парные кавычки.
+
+    Комментарии тут НЕ режем, в отличие от файла: решётка внутри значения,
+    пришедшего из окружения, — часть значения, а не примечание.
+    """
+    value = raw.strip().strip("\r\n")
+    if len(value) > 1 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        value = value[1:-1]
+    return value.strip()
+
+
 def load_secrets(explicit: Path | None = None) -> dict[str, str]:
     """Секреты из файла, поверх — то, что уже есть в окружении процесса."""
     if explicit is not None:
@@ -66,8 +78,16 @@ def load_secrets(explicit: Path | None = None) -> dict[str, str]:
     # Переменные окружения перекрывают файл. На сервере секреты обычно
     # приходят из окружения юнита, а не из файла, поэтому префиксы мини-аппа
     # должны быть в этом списке наравне с провайдерскими.
+    #
+    # Обрезка обязательна: systemd отдаёт значение из EnvironmentFile как есть,
+    # вместе с кавычками и с \r, если файл когда-то трогали из Windows.
+    # Невидимый \r в конце токена — это «Неверный токен!» без единой подсказки,
+    # почему тот же токен работает на другой машине.
     prefixes = ("H3_", "KANDINSKY_", "MAX_", "MINIAPP_")
-    values.update({k: v for k, v in os.environ.items() if k in values or k.startswith(prefixes)})
+    values.update({
+        k: _clean_env_value(v) for k, v in os.environ.items()
+        if k in values or k.startswith(prefixes)
+    })
     values["_secrets_path"] = str(path)
     return values
 

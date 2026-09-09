@@ -99,7 +99,10 @@ def ensure_tools(ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe") -> None:
             )
 
 
-def _run(cmd: list[str], retries: int = 2) -> subprocess.CompletedProcess[str]:
+RUN_TIMEOUT_S = 300.0
+
+
+def _run(cmd: list[str], retries: int = 2, timeout: float = RUN_TIMEOUT_S) -> subprocess.CompletedProcess[str]:
     """Запуск ffmpeg/ffprobe.
 
     stdin обязательно закрыт: ffmpeg читает консоль и на общем stdin несколько
@@ -122,7 +125,15 @@ def _run(cmd: list[str], retries: int = 2) -> subprocess.CompletedProcess[str]:
                 encoding="utf-8",
                 errors="replace",
                 stdin=subprocess.DEVNULL,
+                timeout=timeout,
             )
+        except subprocess.TimeoutExpired as exc:
+            # Без таймаута зависший ffmpeg вешает весь прогон: постобработка
+            # идёт под общим замком, и следом встают все остальные ячейки.
+            raise MediaError(
+                f"{Path(cmd[0]).name} не ответил за {timeout:.0f} с и был снят. "
+                f"Команда: {' '.join(str(c) for c in cmd[:8])}…"
+            ) from exc
         except FileNotFoundError as exc:
             raise MediaError(
                 f"Не найден {cmd[0]}. Запустите get-ffmpeg.bat в папке lab — он положит "
@@ -203,7 +214,7 @@ def detect_speech_window(
         [find_tool(ffmpeg) or ffmpeg, "-nostdin", "-hide_banner", "-v", "info", "-i", str(path),
          "-af", f"silencedetect=noise={threshold_db}dB:d={min_silence_s}", "-f", "null", "-"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, timeout=RUN_TIMEOUT_S,
     )
     log = proc.stderr or ""
     starts = [float(m) for m in re.findall(r"silence_start:\s*([0-9.]+)", log)]
@@ -211,14 +222,82 @@ def detect_speech_window(
     begin = 0.0
     if ends and (not starts or starts[0] <= 0.05):
         begin = ends[0]
+    # Хвостовая тишина — та, что доходит до конца файла. Собираем участки
+    # тишины парами и смотрим только на последний: если он упирается в конец,
+    # это хвост, и речь кончается там, где он начался. Иначе хвоста нет.
+    #
+    # Раньше здесь брался ПЕРВЫЙ silence_start в последних 2.5 с, и любая
+    # пауза внутри записи обрезала всё, что после неё. На записи
+    # «Вот это круто! <пауза> Вот это круто!» отваливался второй дубль,
+    # а у пользователя мини-аппа, который говорит с паузами, — половина
+    # образца голоса. ffmpeg при этом иногда дописывает silence_end на EOF,
+    # а иногда нет, так что считать по длине списков нельзя.
     finish = info.duration_s
-    for s in starts:
-        if s > begin and s >= info.duration_s - 2.5:
-            finish = s
-            break
+    regions = list(zip(starts, ends + [info.duration_s] * (len(starts) - len(ends))))
+    if regions:
+        last_start, last_end = regions[-1]
+        if last_end >= info.duration_s - 0.05 and last_start > begin:
+            finish = last_start
     if finish - begin < 0.5:
         return 0.0, info.duration_s
     return begin, finish
+
+
+def _loudness_segments(
+    path: str | Path,
+    *,
+    min_segment_s: float = 0.25,
+    min_gap_s: float = 0.12,
+    below_peak_db: float = 30.0,
+    ffmpeg: str = "ffmpeg",
+) -> list[tuple[float, float]] | None:
+    """Запасной способ разметки речи: громкость относительно пика.
+
+    Нужен там, где нет webrtcvad — под свежий Python колёс для него не
+    собирают, а собирать из исходников на рабочей машине никто не будет.
+    Прежний откат (detect_speech_window) отдавал ОДИН отрезок «от первого
+    звука до последнего» и поэтому не видел пауз внутри ролика вообще:
+    в отчёте это выглядело как «речь 100% времени» на ролике, где на слух
+    посередине явная пауза.
+
+    Порог берём не абсолютный, а на 30 дБ ниже пика: громкость генераций
+    гуляет, и −35 дБ на тихом ролике режет речь, а на громком не видит
+    тишину. Отдаём None, если numpy нет, — тогда зовущий откатится дальше.
+    """
+    try:
+        import numpy as np  # noqa: PLC0415 — необязательная зависимость
+    except ImportError:
+        return None
+    rate, hop = 16000, 320  # 20 мс
+    proc = subprocess.run(
+        [find_tool(ffmpeg) or ffmpeg, "-nostdin", "-v", "error", "-i", str(path),
+         "-vn", "-ac", "1", "-ar", str(rate), "-f", "s16le", "-"],
+        capture_output=True, stdin=subprocess.DEVNULL, timeout=RUN_TIMEOUT_S,
+    )
+    if not proc.stdout:
+        return []
+    a = np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    frames = a[: len(a) // hop * hop].reshape(-1, hop)
+    if not len(frames):
+        return []
+    db = 20 * np.log10(np.sqrt((frames ** 2).mean(axis=1)) + 1e-9)
+    loud = db > db.max() - below_peak_db
+
+    # Короткие провалы внутри фразы — это смычки согласных, а не паузы.
+    gap = max(1, int(min_gap_s / (hop / rate)))
+    idx = np.flatnonzero(loud)
+    if not len(idx):
+        return []
+    spans: list[list[int]] = [[int(idx[0]), int(idx[0])]]
+    for i in idx[1:]:
+        if i - spans[-1][1] <= gap:
+            spans[-1][1] = int(i)
+        else:
+            spans.append([int(i), int(i)])
+
+    step = hop / rate
+    out = [(round(s * step, 2), round((e + 1) * step, 2)) for s, e in spans]
+    return [(a, b) for a, b in out if b - a >= min_segment_s]
 
 
 def speech_segments(
@@ -245,6 +324,9 @@ def speech_segments(
     try:
         import webrtcvad  # noqa: PLC0415 — необязательная зависимость
     except ImportError:
+        segments = _loudness_segments(path, min_segment_s=min_segment_s, ffmpeg=tool)
+        if segments is not None:
+            return segments, "громкость (numpy)"
         begin, finish = detect_speech_window(path, threshold_db=threshold_db, ffmpeg=ffmpeg)
         segments = [(begin, finish)] if finish - begin >= min_segment_s else []
         return segments, "звук (silencedetect)"
@@ -253,7 +335,7 @@ def speech_segments(
     proc = subprocess.run(
         [tool, "-nostdin", "-v", "error", "-i", str(path),
          "-vn", "-ac", "1", "-ar", str(rate), "-f", "s16le", "-"],
-        capture_output=True, stdin=subprocess.DEVNULL,
+        capture_output=True, stdin=subprocess.DEVNULL, timeout=RUN_TIMEOUT_S,
     )
     pcm = proc.stdout
     if not pcm:
@@ -279,6 +361,63 @@ def speech_segments(
     if start is not None:
         segments.append((round(start, 2), round(info.duration_s, 2)))
     return segments, "речь (webrtcvad)"
+
+
+def flatness(
+    path: str | Path,
+    *,
+    at_seconds: tuple[float, ...] = (0.5, 0.5, 0.5),
+    box: int = 512,
+    ffmpeg: str = "ffmpeg",
+) -> float | None:
+    """Насколько кадр нарисован, а не снят. Доля плоских заливок, 0…1.
+
+    У модели сильный уклон в фотореализм: подаёшь ей плоскую иллюстрацию,
+    а она достраивает кожу, поры и блики. На глаз это спорят словами
+    «ну как-то не так», числом — не спорят.
+
+    Меряем локальный разброс яркости в окне 3×3. У заливки он около нуля,
+    у фотографии — нет. На наших образцах: рисунок 67%, фотография 24%,
+    генерация по рисунку 37–48%, то есть больше половины пути к фото.
+
+    Требует numpy. Нет его — возвращаем None, и метрика просто не покажется.
+    """
+    try:
+        import numpy as np
+        from numpy.lib.stride_tricks import sliding_window_view
+        from PIL import Image
+    except ImportError:
+        # numpy или Pillow не поставлены — метрика просто не считается.
+        return None
+
+    tool = find_tool(ffmpeg) or ffmpeg
+    # Именно find_tool, а не замена подстроки: путь вида
+    # C:\Avatars\tools\ffmpeg\bin\ffmpeg.exe превращается заменой
+    # в несуществующий C:\Avatars\tools\ffprobe\bin\ffprobe.exe.
+    info = probe(path, ffprobe=find_tool("ffprobe") or "ffprobe")
+    # Несколько кадров по ролику: стиль может уплывать к середине.
+    moments = [info.duration_s * share for share in (0.1, 0.5, 0.9)] if info.duration_s else [0.0]
+
+    scores: list[float] = []
+    for moment in moments:
+        proc = subprocess.run(
+            [tool, "-nostdin", "-v", "error", "-ss", f"{moment:.2f}", "-i", str(path),
+             "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+            capture_output=True, stdin=subprocess.DEVNULL, timeout=60,
+        )
+        if not proc.stdout:
+            continue
+        import io
+
+        image = Image.open(io.BytesIO(proc.stdout)).convert("RGB")
+        image.thumbnail((box, box), Image.LANCZOS)
+        grey = np.asarray(image, dtype=np.float32).mean(axis=2)
+        if min(grey.shape) < 3:
+            continue
+        window = sliding_window_view(grey, (3, 3))
+        spread = window.reshape(*window.shape[:2], 9).std(axis=2)
+        scores.append(float((spread < 1.5).mean()))
+    return round(sum(scores) / len(scores), 3) if scores else None
 
 
 def canon_audio(
@@ -355,7 +494,7 @@ def detect_cuts(
         [find_tool(ffmpeg) or ffmpeg, "-nostdin", "-hide_banner", "-v", "info", "-i", str(path),
          "-vf", f"select='gt(scene,{threshold})',metadata=print", "-an", "-f", "null", "-"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, timeout=RUN_TIMEOUT_S,
     )
     log = proc.stderr or ""
     cuts: list[dict] = []

@@ -420,6 +420,64 @@ def flatness(
     return round(sum(scores) / len(scores), 3) if scores else None
 
 
+def drift(
+    path: str | Path,
+    *,
+    box: int = 256,
+    ffmpeg: str = "ffmpeg",
+) -> float | None:
+    """Насколько кадр уезжает по ходу ролика. 0 — не шелохнулся, 1 — всё чужое.
+
+    Нужно там, где вход уже готовая картинка и её надо УДЕРЖАТЬ: стикер,
+    рисованный портрет, вырубленная наклейка. Модели любят «дооживить»
+    кадр — наехать камерой, опустить руку, перекомпоновать сцену, — и на
+    глаз это спор о вкусах: одному «почти не уехало», другому «да он же
+    палец опустил». Числом не спорят.
+
+    Меряем ВНУТРИ ролика: каждый кадр против первого. Сравнивать с исходной
+    картинкой заманчиво, но нечестно — у разных моделей разный формат кадра,
+    и половина «дрейфа» окажется разницей пропорций, а не движением. Внутри
+    одного ролика формат постоянен, и число получается сравнимое.
+
+    Считаем по яркости в маленьком окне: нам важно смещение композиции,
+    а не шум кодека и не оттенок.
+    """
+    try:
+        import io  # noqa: PLC0415
+
+        import numpy as np  # noqa: PLC0415
+        from PIL import Image  # noqa: PLC0415
+    except ImportError:
+        return None
+
+    tool = find_tool(ffmpeg) or ffmpeg
+    info = probe(path, ffprobe=find_tool("ffprobe") or "ffprobe")
+    if not info.duration_s:
+        return None
+    moments = [info.duration_s * share for share in (0.02, 0.25, 0.5, 0.75, 0.97)]
+
+    frames: list[object] = []
+    for moment in moments:
+        proc = subprocess.run(
+            [tool, "-nostdin", "-v", "error", "-ss", f"{moment:.2f}", "-i", str(path),
+             "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+            capture_output=True, stdin=subprocess.DEVNULL, timeout=60,
+        )
+        if not proc.stdout:
+            continue
+        image = Image.open(io.BytesIO(proc.stdout)).convert("L").resize(
+            (box, box), Image.LANCZOS)
+        frames.append(np.asarray(image, dtype=np.float32) / 255.0)
+
+    if len(frames) < 2:
+        return None
+    first = frames[0]
+    # Максимум, а не среднее: важно самое сильное расхождение за ролик.
+    # Кадр может уехать к концу и вернуться — для «удержал ли образ»
+    # это всё равно уехал.
+    return round(max(float(np.abs(other - first).mean()) for other in frames[1:]), 3)
+
+
 def canon_audio(
     src: str | Path,
     dst: str | Path,
